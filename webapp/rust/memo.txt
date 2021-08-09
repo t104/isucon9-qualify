@@ -1,0 +1,8 @@
+mysql -h mysql -P 3306 -u isucon -pisucon
+
+curl -XPOST -H "Content-Type: application/json" \
+-d '{"payment_service_url": "http://localhost:5000", "shipment_service_url": "http://localhost:6000"}' \
+http://localhost:1323/initialize
+
+curl -XPOST -H "Content-Type: application/json" \
+http://localhost:1323/initialize
