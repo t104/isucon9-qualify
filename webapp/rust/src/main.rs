@@ -1,8 +1,13 @@
 use actix_multipart::Multipart;
+use actix_rt::blocking::BlockingError;
+use actix_web::error::ErrorBadRequest;
 use actix_web::{middleware, web, get, post, error, App, Error as AWError, HttpResponse, HttpServer};
+use bytes::BytesMut;
 use listenfd::ListenFd;
-use mysql::prelude::Queryable;
-// use bytes::BytesMut;
+use mysql::MySqlError;
+use mysql::prelude::{FromRow, Queryable};
+use r2d2::PooledConnection;
+use r2d2_mysql::MysqlConnectionManager;
 // use futures::TrystreamExt;
 // use listenfd::ListenFd;
 // use mysql::prelude::*;
@@ -12,6 +17,9 @@ use std::{clone, env};
 // use std::cmp;
 // use std::fs::File;
 use std::sync::Arc;
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+
+use crate::models::*;
 
 type Pool = r2d2::Pool<r2d2_mysql::MysqlConnectionManager>;
 type BlockingDBError = actix_web::error::BlockingError<mysql::Error>;
@@ -45,12 +53,15 @@ const ShippingsStatusDone: &str = "done";
 
 const BumpChargeSeconds: i32 = 3;
 
-const ItemsPerPage: i32 = 48;
+const ItemsPerPage: usize = 48;
 const TransactionsPerPage: i32 = 10;
 
 const BcryptCost: i32 = 10;
 
 const MAX_SIZE: usize = 262_144;
+const DBConnectionCheckoutErrorMsg: &str = "Failed to checkout database connection";
+
+mod models;
 
 #[derive(Debug)]
 struct MySQLConnectionEnv {
@@ -106,6 +117,9 @@ async fn main() -> Result<(), std::io::Error> {
             .wrap(middleware::Logger::default())
             .service(index)
             .service(initialize)
+            .service(getNewItems)
+            .service(getNewCategoryItems)
+            // .service(getTransactions)
         );
     let mut listenfd = ListenFd::from_env();
     let server = if let Some(l) = listenfd.take_tcp_listener(0)? {
@@ -121,12 +135,68 @@ async fn main() -> Result<(), std::io::Error> {
     server.run().await
 }
 
+/*
+ * Common functions
+ */
+
+fn getUserSimpleById(
+    user_id: i64,
+    db: &web::Data<Pool>,
+) -> Result<Option<UserSimple>, mysql::Error> {
+    let mut conn = db.get().expect("Failed to checkout database connection");
+    conn.query_map(
+        format!("SELECT id, account_name, num_sell_items FROM users WHERE id = {}", user_id),
+        |(id, account_name, num_sell_items)|
+        UserSimple {
+            id, account_name, num_sell_items
+        }
+    )
+    .map(|mut users| users.pop())
+}
+
+fn getImageUrl(image_name: &String) -> String {
+    format!("/upload/{}", image_name)
+}
+
+fn getCategoryById(
+    category_id: i32,
+    db: &web::Data<Pool>,
+) -> Result<Option<Category>, mysql::Error> {
+    let mut conn = db.get().expect("Failed to checkout database connection");
+    conn.query_map(
+        format!("SELECT * FROM categories WHERE id = {}", category_id),
+        |(id, parent_id, category_name)| {
+            let parent_category_name = if parent_id == 0 {
+                String::from("")
+            } else {
+                let parent_category = getCategoryById(parent_id, &db)
+                .unwrap_or(None);
+                match parent_category {
+                    Some(p) => p.category_name,
+                    None => String::from(""),
+                }
+            };
+            Category {
+                id, parent_id, category_name, parent_category_name
+            }
+        }
+    )
+    .map(|mut categories| categories.pop())
+}
+
+/*
+ * API
+ */
+
+// region: index
 #[get("/")]
 async fn index() -> Result<HttpResponse, actix_web::Error> {
     let response_body = "Hello World!";
     Ok(HttpResponse::Ok().body(response_body))
 }
+// endregion
 
+// region: initialize
 #[derive(Deserialize)]
 struct InitializeRequest {
     payment_service_url: String,
@@ -159,6 +229,7 @@ async fn initialize(
     let paths = [
         sql_dir.join("01_schema.sql"),
         sql_dir.join("02_categories.sql"),
+        sql_dir.join("initial.sql"),
     ];
     for p in paths.iter() {
         let sql_file = p.canonicalize().unwrap();
@@ -219,3 +290,302 @@ async fn initialize(
         language: "rust".to_owned(),
     }))
 }
+// endregion
+
+// region: getNewItems
+#[derive(Debug, Deserialize)]
+struct GetNewItemsParams {
+    pub item_id: Option<i64>,
+    pub created_at: Option<i64>,
+}
+
+impl GetNewItemsParams {
+    fn validate(&self) -> Result<(), HttpResponse> {
+        match self.item_id {
+            Some(item_id) => {
+                if (0 < item_id) {
+                    match self.created_at {
+                        Some(created_at) => {
+                            if (0 < created_at) {
+                                Ok(())
+                            } else {
+                                Err(HttpResponse::BadRequest().json(
+                                    BadRequestResponse {
+                                        error: "created_at param error".to_string()
+                                    }
+                                ))
+                            }
+                        }
+                        _ => Ok(())
+                    }
+                } else {
+                    Err(HttpResponse::BadRequest().json(
+                        BadRequestResponse {
+                            error: "item_id param error".to_string()
+                        }
+                    ))
+                }
+            }
+            _ => Ok(())
+        }
+    }
+}
+
+#[get("/new_items.json")]
+async fn getNewItems(
+    db: web::Data<Pool>,
+    query_params: web::Query<GetNewItemsParams>,
+) -> Result<HttpResponse, AWError> {
+    let query_validation = query_params.validate();
+    if (query_validation.is_err()) {
+        return Ok(query_validation.unwrap_err())
+    }
+
+
+    let res = web::block(move || {
+        let mut conn = db.get().expect("Failed to checkout database connection");
+
+        let items = if query_params.item_id.is_some() && query_params.created_at.is_some() {
+            let item_id = query_params.item_id.unwrap();
+            let created_at = query_params.created_at.unwrap();
+            // paging
+            let query = format!(
+                "SELECT * FROM items WHERE status IN ('{}', '{}') AND (created_at < from_unixtime({}) OR (created_at <= from_unixtime({}) AND id < {})) ORDER BY created_at DESC, id DESC LIMIT {}",
+                ItemStatusOnSale,
+                ItemStatusSoldOut,
+                created_at,
+                created_at,
+                item_id,
+                ItemsPerPage + 1,
+            );
+            conn.query_map(
+                query,
+                Item::from_row
+            )
+        } else {
+            let query = format!(
+                "SELECT * FROM items WHERE status IN ('{}', '{}') ORDER BY created_at DESC, id DESC LIMIT {}",
+                ItemStatusOnSale,
+                ItemStatusSoldOut,
+                ItemsPerPage + 1,
+            );
+            conn.query_map(
+                query,
+                Item::from_row
+            )
+        }?;
+
+        let mut item_simples: Vec<ItemSimple> = Vec::new();
+        for item in items.iter() {
+            let seller = getUserSimpleById(item.seller_id, &db)?;
+            let category = getCategoryById(item.category_id, &db)?;
+            if seller.is_some() && category.is_some() {
+                item_simples.push(
+                    ItemSimple {
+                    id: item.id,
+                    seller_id: item.seller_id,
+                    seller: seller.unwrap(),
+                    status: item.status.clone(),
+                    name: item.name.clone(),
+                    image_url: getImageUrl(&item.image_name),
+                    category_id: item.category_id,
+                    category: category.unwrap(),
+                    created_at: item.created_at,
+                });
+            }
+        }
+
+        let has_next = item_simples.len() > ItemsPerPage;
+        while item_simples.len() > ItemsPerPage  {
+            item_simples.pop();
+        }
+        Ok(
+            NewItemsResponse {
+                root_category_id: None,
+                root_category_name: None,
+                items: item_simples,
+                has_next: has_next,
+            }
+        )
+    })
+    .await
+    .map_err(|e: BlockingDBError| {
+        log::error!("getNewItems DB execution error : {:?}", e);
+        HttpResponse::InternalServerError()
+    })?;
+    Ok(
+        HttpResponse::Ok().json(res)
+    )
+}
+// endregion
+
+// region: getNewCategoryItems
+#[derive(Debug, Deserialize)]
+struct GetNewCategoryItemsParam {
+    item_id: Option<i64>,
+    created_at: Option<i64>,
+}
+
+impl GetNewCategoryItemsParam {
+    fn validate(&self) -> Result<(), HttpResponse> {
+        match self.item_id {
+            Some(item_id) => {
+                if (0 < item_id) {
+                    match self.created_at {
+                        Some(created_at) => {
+                            if (0 < created_at) {
+                                Ok(())
+                            } else {
+                                Err(HttpResponse::BadRequest().json(
+                                    BadRequestResponse {
+                                        error: "created_at param error".to_string()
+                                    }
+                                ))
+                            }
+                        }
+                        _ => Ok(())
+                    }
+                } else {
+                    Err(HttpResponse::BadRequest().json(
+                        BadRequestResponse {
+                            error: "item_id param error".to_string()
+                        }
+                    ))
+                }
+            }
+            _ => Ok(())
+        }
+    }
+}
+
+#[get("/new_items/{root_category_id}.json")]
+async fn getNewCategoryItems(
+    db: web::Data<Pool>,
+    path: web::Path<(i32)>,
+    query_params: web::Query<GetNewCategoryItemsParam>,
+)
+-> Result<HttpResponse, AWError> {
+    let query_validation = query_params.validate();
+    if (query_validation.is_err()) {
+        return Ok(query_validation.unwrap_err())
+    }
+
+    let (root_category_id) = path.into_inner();
+
+    let res = web::block(move || {
+        let mut conn = db.get().expect(DBConnectionCheckoutErrorMsg);
+        let root_category = getCategoryById(root_category_id, &db)?;
+        let category_ids: Vec<i32> = conn.query(
+            format!("SELECT id FROM categories WHERE parent_id={}", root_category_id)
+        )?;
+        let category_ids_str: Vec<String> = category_ids
+            .iter()
+            .map(|id| format!("'{}'", id))
+            .collect();
+        let items: Vec<Item> = if category_ids.len() == 0 {
+            Ok(Vec::new())
+        } else if query_params.item_id.is_some() && query_params.created_at.is_some() {
+            let item_id = query_params.item_id.unwrap();
+            let created_at = query_params.created_at.unwrap();
+            let sql = format!(
+                "SELECT * FROM items
+                WHERE status IN ('{}', '{}') AND
+                category_id IN ({}) AND
+                created_at < '{}'
+                ORDER BY created_at DESC, id DESC LIMIT {}",
+                ItemStatusOnSale,
+                ItemStatusSoldOut,
+                category_ids_str.join(","),
+                NaiveDateTime::from_timestamp(created_at, 0),
+                ItemsPerPage + 1
+            );
+            db.get().expect(DBConnectionCheckoutErrorMsg).query_map(
+                sql,
+                Item::from_row
+            )
+        } else {
+            let sql = format!(
+                "SELECT * FROM items
+                WHERE status IN ('{}', '{}') AND category_id IN ({})
+                ORDER BY created_at DESC, id DESC LIMIT {}",
+                ItemStatusOnSale,
+                ItemStatusSoldOut,
+                category_ids_str.join(","),
+                ItemsPerPage + 1
+            );
+            db.get().expect(DBConnectionCheckoutErrorMsg).query_map(
+                sql,
+                Item::from_row
+            )
+        }?;
+        let mut item_simples: Vec<ItemSimple> = Vec::new();
+        for item in items.iter() {
+            let seller = getUserSimpleById(item.seller_id, &db)?;
+            let category = getCategoryById(item.category_id, &db)?;
+            if seller.is_some() && category.is_some() {
+                item_simples.push(
+                    ItemSimple {
+                    id: item.id,
+                    seller_id: item.seller_id,
+                    seller: seller.unwrap(),
+                    status: item.status.clone(),
+                    name: item.name.clone(),
+                    image_url: getImageUrl(&item.image_name),
+                    category_id: item.category_id,
+                    category: category.unwrap(),
+                    created_at: item.created_at,
+                });
+            }
+        }
+
+        let has_next = item_simples.len() > ItemsPerPage;
+        while item_simples.len() > ItemsPerPage  {
+            item_simples.pop();
+        }
+        Ok(
+            NewItemsResponse {
+                root_category_id: Some(root_category_id),
+                root_category_name: root_category.map(|op| op.category_name),
+                items: item_simples,
+                has_next: has_next,
+            }
+        )
+    })
+    .await
+    .map_err(|e: BlockingDBError| {
+        log::error!("getNewCategoryItems DB execution error {:?}", e);
+        HttpResponse::InternalServerError()
+    })?;
+
+    Ok(HttpResponse::Ok().json(res))
+}
+// endregion
+
+// region: getTransaction
+// #[derive(Debug, Deserialize)]
+// struct GetTransactionsRequest {
+//     pub item_id: Option<i64>,
+//     pub created_at: Option<i64>
+// }
+
+// impl GetTransactionsRequest {
+//     fn isSome(&self) -> bool {
+//         self.item_id.is_some() && self.created_at.is_some()
+//     }
+
+//     fn isOutOfRange(&self) -> bool {
+//         match (self.item_id, self.created_at) {
+//             (Some(item_id), Some(created_at)) => {
+//                 0 < item_id && 0 < created_at
+//             }
+//             _ => true
+//         }
+//     }
+// }
+
+// #[get("/users/transactions.json")]
+// async fn getTransactions(
+//     db: web::Data<Pool>,
+//     query_params: web::Query<GetTransactionsRequest>,
+// ) -> Result<HttpResponse, AWError> {}
+// endregion
