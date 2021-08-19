@@ -6,11 +6,42 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 pub struct User {
     pub id: i64,
     pub account_name: String,
-    pub hashed_password: BytesMut,
+    pub hashed_password: Option<Vec<u8>>,
     pub address: String,
     pub num_sell_items: i32,
     pub last_bump: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+impl FromRow for User {
+    fn from_row(row: mysql::Row) -> User {
+        match from_row_opt(row) {
+            Ok(u) => u,
+            Err(err) => panic!("Convert row error: {:?} to User", err),
+        }
+    }
+    
+    fn from_row_opt(row: mysql::Row) -> Result<User, mysql::FromRowError> {
+        mysql::from_row_opt(row).map(|(
+            id,
+            account_name,
+            hashed_password,
+            address,
+            num_sell_items,
+            last_bump,
+            created_at
+        )| {
+            User {
+                id: id,
+                account_name: account_name,
+                hashed_password: hashed_password,
+                address: address,
+                num_sell_items: num_sell_items,
+                last_bump: Utc.from_utc_datetime(&last_bump),
+                created_at: Utc.from_utc_datetime(&created_at),
+            }
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,7 +197,7 @@ pub struct RegisterRequest {
     password: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LoginRequest {
     pub account_name: String,
     pub password: String,
@@ -232,3 +263,10 @@ pub struct SettingResponse {
 pub struct BadRequestResponse {
     pub error: String
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UserLoginSession {
+    pub user_id: i64,
+    pub csrf_token: String,
+}
+

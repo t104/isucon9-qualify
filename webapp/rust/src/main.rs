@@ -2,21 +2,25 @@ use actix_multipart::Multipart;
 use actix_rt::blocking::BlockingError;
 use actix_web::error::ErrorBadRequest;
 use actix_web::{middleware, web, get, post, error, App, Error as AWError, HttpResponse, HttpServer};
+use actix_session::{CookieSession, Session};
 use bytes::BytesMut;
 use listenfd::ListenFd;
 use mysql::MySqlError;
 use mysql::prelude::{FromRow, Queryable};
+use pwhash::bcrypt;
 use r2d2::PooledConnection;
 use r2d2_mysql::MysqlConnectionManager;
+use rand::distributions::Alphanumeric;
 // use futures::TrystreamExt;
 // use listenfd::ListenFd;
 // use mysql::prelude::*;
 use serde::{Deserialize, Serialize};
 use tokio::stream::StreamExt;
-use std::{clone, env};
+use std::{clone, env, iter};
 // use std::cmp;
 // use std::fs::File;
 use std::sync::Arc;
+use rand::{Rng, thread_rng};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
 use crate::models::*;
@@ -115,10 +119,12 @@ async fn main() -> Result<(), std::io::Error> {
             .data(pool.clone())
             .data(mysql_connection_env.clone())
             .wrap(middleware::Logger::default())
+            .wrap(CookieSession::signed(&[0; 32]).secure(false))
             .service(index)
             .service(initialize)
             .service(getNewItems)
             .service(getNewCategoryItems)
+            .service(login)
             // .service(getTransactions)
         );
     let mut listenfd = ListenFd::from_env();
@@ -135,9 +141,7 @@ async fn main() -> Result<(), std::io::Error> {
     server.run().await
 }
 
-/*
- * Common functions
- */
+// region common functions
 
 fn getUserSimpleById(
     user_id: i64,
@@ -183,6 +187,25 @@ fn getCategoryById(
     )
     .map(|mut categories| categories.pop())
 }
+
+fn hashPassword(password: &String) -> Vec<u8> {
+    bcrypt::hash(password).unwrap().as_bytes().to_vec()
+}
+
+fn verifyPassword(password: &String, hash: Vec<u8>) -> bool {
+    bcrypt::verify(password, std::str::from_utf8(hash.as_slice()).unwrap())
+}
+
+fn generateCSRF() -> String {
+    let mut rng = thread_rng();
+    iter::repeat(())
+    .map(|()| rng.sample(Alphanumeric))
+    .map(char::from)
+    .take(10)
+    .collect()
+}
+
+// endregion
 
 /*
  * API
@@ -340,7 +363,6 @@ async fn getNewItems(
     if (query_validation.is_err()) {
         return Ok(query_validation.unwrap_err())
     }
-
 
     let res = web::block(move || {
         let mut conn = db.get().expect("Failed to checkout database connection");
@@ -562,30 +584,166 @@ async fn getNewCategoryItems(
 // endregion
 
 // region: getTransaction
-// #[derive(Debug, Deserialize)]
-// struct GetTransactionsRequest {
-//     pub item_id: Option<i64>,
-//     pub created_at: Option<i64>
-// }
+#[derive(Debug, Deserialize)]
+struct GetTransactionsRequest {
+    pub item_id: Option<i64>,
+    pub created_at: Option<i64>
+}
 
-// impl GetTransactionsRequest {
-//     fn isSome(&self) -> bool {
-//         self.item_id.is_some() && self.created_at.is_some()
-//     }
-
-//     fn isOutOfRange(&self) -> bool {
-//         match (self.item_id, self.created_at) {
-//             (Some(item_id), Some(created_at)) => {
-//                 0 < item_id && 0 < created_at
-//             }
-//             _ => true
-//         }
-//     }
-// }
+impl GetTransactionsRequest {
+    fn validate(&self) -> Result<(), HttpResponse> {
+        match self.item_id {
+            Some(item_id) => {
+                if (0 < item_id) {
+                    match self.created_at {
+                        Some(created_at) => {
+                            if (0 < created_at) {
+                                Ok(())
+                            } else {
+                                Err(HttpResponse::BadRequest().json(
+                                    BadRequestResponse {
+                                        error: "created_at param error".to_string()
+                                    }
+                                ))
+                            }
+                        }
+                        _ => Ok(())
+                    }
+                } else {
+                    Err(HttpResponse::BadRequest().json(
+                        BadRequestResponse {
+                            error: "item_id param error".to_string()
+                        }
+                    ))
+                }
+            }
+            _ => Ok(())
+        }
+    }
+}
 
 // #[get("/users/transactions.json")]
 // async fn getTransactions(
 //     db: web::Data<Pool>,
 //     query_params: web::Query<GetTransactionsRequest>,
-// ) -> Result<HttpResponse, AWError> {}
+// ) -> Result<HttpResponse, AWError> {
+//     let query_validation = query_params.validate();
+//     if (query_validation.is_err()) {
+//         return Ok(query_validation.unwrap_err())
+//     }
+
+//     let res = web::block(move || {
+//         let items = match (query_params.item_id, query_params.created_at) {
+//             (Some(item_id), Some(created_at)) => {
+//                 let sql = format!(
+//                     "SELECT * FROM items 
+//                     WHERE (seller_id = {} OR buyer_id = {}) AND
+//                     status IN ('{}', '{}', '{}', '{}', '{}') AND
+//                     (created_at < '{}' OR (created_at <= '{}' AND id < {}))
+//                     ORDER BY created_at DESC, id DESC LIMIT {}",
+
+//                 )
+//             }
+//             _ => {}
+//         }
+//     })
+// }
+// endregion
+
+// region: login
+#[derive(Debug, Serialize)]
+struct LoginResponse {
+    id: i64,
+    account_name: String,
+    address: String,
+    num_sell_items: i32,
+}
+
+impl FromRow for LoginResponse {
+    fn from_row(row: mysql::Row) -> LoginResponse {
+        match Self::from_row_opt(row) {
+            Ok(r) => r,
+            Err(err) => panic!("Convert row error: {:?} to LoginResponse", err),
+        }
+    }
+    fn from_row_opt(row: mysql::Row) -> Result<LoginResponse, mysql::FromRowError> {
+        mysql::from_row_opt(row).map(|(
+            id,
+            account_name,
+            address,
+            num_sell_items
+        )|{
+            LoginResponse {
+                id: id,
+                account_name: account_name,
+                address: address,
+                num_sell_items: num_sell_items,
+            }
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LoginErrorResponse {
+    error: String,
+}
+
+#[post("/login")]
+async fn login(
+    db: web::Data<Pool>,
+    session: Session,
+    req: web::Json<LoginRequest>,
+) -> Result<HttpResponse, AWError> {
+
+    let account_name = req.account_name.clone();
+    let user: Option<User> = web::block(move || {
+        let sql = format!(
+            "SELECT * FROM users WHERE account_name = '{}'",
+            account_name
+        );
+        Ok(
+            db.get().expect(DBConnectionCheckoutErrorMsg).query_first::<User, _>(sql)?
+        )
+    })
+    .await
+    .map_err(|e: BlockingDBError| {
+        log::error!("login DB execution error: {:?}", e);
+        HttpResponse::InternalServerError()
+    })?;
+
+    let unauthorized_response = HttpResponse::Unauthorized().json(
+        LoginErrorResponse {
+            error: "アカウント名かパスワードが間違えています".to_string(),
+        }
+    );
+
+    match user {
+        Some(u) => {
+            match u.hashed_password {
+                Some(hash) => {
+                    if verifyPassword(&req.password, hash) {
+                        session.set("user-session", UserLoginSession{
+                            user_id: u.id,
+                            csrf_token: generateCSRF()
+                        });
+                        Ok(
+                            HttpResponse::Ok().json(
+                                LoginResponse {
+                                    id: u.id,
+                                    account_name: u.account_name,
+                                    address: u.address,
+                                    num_sell_items: u.num_sell_items,
+                                }
+                            )
+                        )
+                    } else {
+                        Ok(unauthorized_response)
+                    }
+                }
+                _ => Ok(unauthorized_response)
+            }
+        },
+        _ => Ok(unauthorized_response)
+    }
+}
 // endregion
